@@ -103,7 +103,7 @@ class BotBalanceEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
 
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        return torch.Tensor(False), time_out
+        return False, time_out # type:ignore
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:

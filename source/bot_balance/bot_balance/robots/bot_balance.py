@@ -1,7 +1,7 @@
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg
 from isaaclab.actuators import ImplicitActuatorCfg
-import variables
+from bot_balance.robots import variables
 
 BOT_BALANCE_CONFIG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(

@@ -31,4 +31,4 @@ class BotBalanceEnvCfg(DirectRLEnvCfg):
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
 
-    dof_names = ['joint_left_wheel', 'joint_right_wheel']
+    dof_names = ['joint_right_wheel', 'joint_left_wheel']

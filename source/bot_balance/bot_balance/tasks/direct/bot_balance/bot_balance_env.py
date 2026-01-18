@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import math
 import torch
 from collections.abc import Sequence
 
@@ -13,10 +12,30 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import sample_uniform
+import isaaclab.utils.math as math_utils
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 from .bot_balance_env_cfg import BotBalanceEnvCfg
 
+def define_markers() -> VisualizationMarkers:
+    '''Define markers with various different shapes'''
+    marker_cfg = VisualizationMarkersCfg(
+        prim_path='/Visuals/myMarkers',
+        markers={
+            'forward': sim_utils.UsdFileCfg(
+                usd_path=f'{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd',
+                scale=(0.25, 0.25, 0.5),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 1.0)),
+            ),
+            'command': sim_utils.UsdFileCfg(
+                usd_path=f'{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd',
+                scale=(0.25, 0.25, 0.5),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+            ),
+        },
+    )
+    return VisualizationMarkers(cfg=marker_cfg)
 
 class BotBalanceEnv(DirectRLEnv):
     cfg: BotBalanceEnvCfg
@@ -24,11 +43,7 @@ class BotBalanceEnv(DirectRLEnv):
     def __init__(self, cfg: BotBalanceEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
-        self._cart_dof_idx, _ = self.robot.find_joints(self.cfg.cart_dof_name)
-        self._pole_dof_idx, _ = self.robot.find_joints(self.cfg.pole_dof_name)
-
-        self.joint_pos = self.robot.data.joint_pos
-        self.joint_vel = self.robot.data.joint_vel
+        self.dof_idx, _ = self.robot.find_joints(self.cfg.dof_names)
 
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
@@ -49,87 +64,27 @@ class BotBalanceEnv(DirectRLEnv):
         self.actions = actions.clone()
 
     def _apply_action(self) -> None:
-        self.robot.set_joint_effort_target(self.actions * self.cfg.action_scale, joint_ids=self._cart_dof_idx)
+        self.robot.set_joint_velocity_target(self.actions, joint_ids=self.dof_idx)
 
     def _get_observations(self) -> dict:
-        obs = torch.cat(
-            (
-                self.joint_pos[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
-                self.joint_vel[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
-                self.joint_pos[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
-                self.joint_vel[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
-            ),
-            dim=-1,
-        )
-        observations = {"policy": obs}
+        self.velocity = self.robot.data.root_com_lin_vel_b
+        observations = {"policy": self.velocity}
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        total_reward = compute_rewards(
-            self.cfg.rew_scale_alive,
-            self.cfg.rew_scale_terminated,
-            self.cfg.rew_scale_pole_pos,
-            self.cfg.rew_scale_cart_vel,
-            self.cfg.rew_scale_pole_vel,
-            self.joint_pos[:, self._pole_dof_idx[0]],
-            self.joint_vel[:, self._pole_dof_idx[0]],
-            self.joint_pos[:, self._cart_dof_idx[0]],
-            self.joint_vel[:, self._cart_dof_idx[0]],
-            self.reset_terminated,
-        )
+        total_reward = torch.linalg.norm(self.velocity, dim=-1, keepdim=True)
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        self.joint_pos = self.robot.data.joint_pos
-        self.joint_vel = self.robot.data.joint_vel
 
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        out_of_bounds = torch.any(torch.abs(self.joint_pos[:, self._cart_dof_idx]) > self.cfg.max_cart_pos, dim=1)
-        out_of_bounds = out_of_bounds | torch.any(torch.abs(self.joint_pos[:, self._pole_dof_idx]) > math.pi / 2, dim=1)
-        return out_of_bounds, time_out
+        return torch.Tensor(False), time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
         super()._reset_idx(env_ids)
 
-        joint_pos = self.robot.data.default_joint_pos[env_ids]
-        joint_pos[:, self._pole_dof_idx] += sample_uniform(
-            self.cfg.initial_pole_angle_range[0] * math.pi,
-            self.cfg.initial_pole_angle_range[1] * math.pi,
-            joint_pos[:, self._pole_dof_idx].shape,
-            joint_pos.device,
-        )
-        joint_vel = self.robot.data.default_joint_vel[env_ids]
-
         default_root_state = self.robot.data.default_root_state[env_ids]
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
-
-        self.joint_pos[env_ids] = joint_pos
-        self.joint_vel[env_ids] = joint_vel
-
-        self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
-        self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
-        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
-
-
-@torch.jit.script
-def compute_rewards(
-    rew_scale_alive: float,
-    rew_scale_terminated: float,
-    rew_scale_pole_pos: float,
-    rew_scale_cart_vel: float,
-    rew_scale_pole_vel: float,
-    pole_pos: torch.Tensor,
-    pole_vel: torch.Tensor,
-    cart_pos: torch.Tensor,
-    cart_vel: torch.Tensor,
-    reset_terminated: torch.Tensor,
-):
-    rew_alive = rew_scale_alive * (1.0 - reset_terminated.float())
-    rew_termination = rew_scale_terminated * reset_terminated.float()
-    rew_pole_pos = rew_scale_pole_pos * torch.sum(torch.square(pole_pos).unsqueeze(dim=1), dim=-1)
-    rew_cart_vel = rew_scale_cart_vel * torch.sum(torch.abs(cart_vel).unsqueeze(dim=1), dim=-1)
-    rew_pole_vel = rew_scale_pole_vel * torch.sum(torch.abs(pole_vel).unsqueeze(dim=1), dim=-1)
-    total_reward = rew_alive + rew_termination + rew_pole_pos + rew_cart_vel + rew_pole_vel
-    return total_reward
+        self.robot.write_root_state_to_sim(default_root_state, env_ids)

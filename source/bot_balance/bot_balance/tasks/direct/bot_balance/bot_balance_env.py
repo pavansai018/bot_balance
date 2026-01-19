@@ -92,18 +92,26 @@ class BotBalanceEnv(DirectRLEnv):
         self.robot.set_joint_velocity_target(self.actions, joint_ids=self.dof_idx)
 
     def _get_observations(self) -> dict:
-        self.velocity = self.robot.data.root_com_lin_vel_b
-        observations = {"policy": self.velocity}
+        self.velocity = self.robot.data.root_com_lin_vel_w
+        self.forwards = math_utils.quat_apply(self.robot.data.root_link_quat_w, self.robot.data.FORWARD_VEC_B)
+        obs = torch.hstack((self.velocity, self.commands))
+        observations = {"policy": obs}
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        total_reward = torch.linalg.norm(self.velocity, dim=-1, keepdim=True)
+        forward_reward = self.robot.data.root_com_lin_vel_b[:, 0]
+        alignment_reward = torch.sum(self.forwards * self.commands, dim=-1)
+        total_reward = forward_reward + alignment_reward
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-
+        terminated = torch.zeros(
+            self.cfg.scene.num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        return False, time_out # type:ignore
+        return terminated, time_out # type:ignore
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:

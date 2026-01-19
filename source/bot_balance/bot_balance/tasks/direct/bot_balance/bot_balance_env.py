@@ -63,7 +63,7 @@ class BotBalanceEnv(DirectRLEnv):
         self.visualization_markers = define_markers()
 
         # setting aside useful variables for later
-        self.up_dir = torch.tensor([0.0, 0.0, 1.0]).cuda()
+        # self.up_dir = torch.tensor([0.0, 0.0, 1.0]).cuda()
         self.yaws = torch.zeros((self.cfg.scene.num_envs, 1)).cuda()
         self.commands = torch.randn((self.cfg.scene.num_envs, 3)).cuda()
         self.commands[:,-1] = 0.0
@@ -94,24 +94,58 @@ class BotBalanceEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         self.velocity = self.robot.data.root_com_lin_vel_w
         self.forwards = math_utils.quat_apply(self.robot.data.root_link_quat_w, self.robot.data.FORWARD_VEC_B)
-        obs = torch.hstack((self.velocity, self.commands))
+
+        dot = torch.sum(self.forwards * self.commands, dim=-1, keepdim=True)
+        cross = torch.cross(self.forwards, self.commands, dim=-1)[:,-1].reshape(-1,1)
+        forward_speed = self.robot.data.root_com_lin_vel_b[:,0].reshape(-1,1)
+        obs = torch.hstack((dot, cross, forward_speed))
+        # obs = torch.hstack((self.velocity, self.commands))
         observations = {"policy": obs}
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        forward_reward = self.robot.data.root_com_lin_vel_b[:, 0]
-        alignment_reward = torch.sum(self.forwards * self.commands, dim=-1)
-        total_reward = forward_reward + alignment_reward
-        return total_reward
+        # uprightness
+        up_dir = torch.zeros_like(self.robot.data.root_com_lin_vel_w)
+        up_dir[:, 2] = 1.0
+        body_up = math_utils.quat_apply(
+            self.robot.data.root_quat_w,
+            up_dir,
+        )
+        upright_reward = body_up[:, 2]
+        # velocity tracking (optional early on)
+        forward_vel = self.robot.data.root_com_lin_vel_b[:, 0]
+
+        # penalties
+        ang_vel = self.robot.data.root_ang_vel_w
+        angular_penalty = torch.sum(ang_vel**2, dim=-1)
+
+        action_penalty = torch.sum(self.actions**2, dim=-1)
+        vertical_vel_penalty = self.robot.data.root_com_lin_vel_w[:, 2]**2
+
+        reward = (
+            2.0 * upright_reward
+            + 0.5 * forward_vel
+            - 0.1 * angular_penalty
+            - 0.01 * action_penalty
+            - 1.0 * vertical_vel_penalty
+        )
+        return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        terminated = torch.zeros(
-            self.cfg.scene.num_envs,
-            dtype=torch.bool,
+        up_dir = torch.zeros(
+            (self.cfg.scene.num_envs, 3),
             device=self.device,
         )
+        up_dir[:, 2] = 1.0
+
+        body_up = math_utils.quat_apply(
+            self.robot.data.root_quat_w,
+            up_dir,
+        )
+
+        fallen = body_up[:, 2] < 0.5
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        return terminated, time_out # type:ignore
+        return fallen, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
@@ -139,7 +173,16 @@ class BotBalanceEnv(DirectRLEnv):
         # get marker locations and orientations
         self.marker_locations = self.robot.data.root_pos_w
         self.forward_marker_orientations = self.robot.data.root_quat_w
-        self.command_marker_orientations = math_utils.quat_from_angle_axis(self.yaws, self.up_dir).squeeze()
+        up_dir = torch.zeros(
+            (self.cfg.scene.num_envs, 3),
+            device=self.device,
+        )
+        up_dir[:, 2] = 1.0
+
+        self.command_marker_orientations = math_utils.quat_from_angle_axis(
+            self.yaws.squeeze(-1),
+            up_dir,
+        )
 
         # offset markers so they are above the jetbot
         loc = self.marker_locations + self.marker_offset
